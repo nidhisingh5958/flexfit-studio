@@ -64,4 +64,4 @@ src/
   server/       tRPC routers
 documents/      empty, for your own notes
 ```
-# flexfit-studio
+
