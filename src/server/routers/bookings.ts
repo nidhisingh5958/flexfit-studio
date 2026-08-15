@@ -1,8 +1,14 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { bookings, classes, memberships, checkins, users } from "@/db/schema";
 import { router, protectedProcedure, staffProcedure } from "../trpc";
+import { adjustIndividualCredits } from "@/server/domain/membership/credits";
+import { hoursUntil } from "@/server/domain/shared/time";
+import { activeMembershipFor } from "@/server/domain/membership/active-membership";
+import { canManageBooking } from "@/server/domain/booking/authorization";
+import { countActiveBookings } from "@/server/domain/booking/capacity";
+import { findOldestWaitlistedBooking } from "@/server/domain/booking/waitlist";
 
 /**
  * Members may cancel free of charge up to this many hours before the class
@@ -12,29 +18,6 @@ export const FREE_CANCELLATION_HOURS = 12;
 
 /** Plans with this many credits are treated as unlimited and never decrement. */
 export const UNLIMITED_CREDITS = 999;
-
-function hoursUntil(iso: string, now = new Date()): number {
-  return (new Date(iso).getTime() - now.getTime()) / 36e5;
-}
-
-async function activeMembershipFor(
-  db: typeof import("@/db").db,
-  userId: number,
-) {
-  const today = new Date().toISOString().slice(0, 10);
-  return db
-    .select()
-    .from(memberships)
-    .where(
-      and(
-        eq(memberships.userId, userId),
-        eq(memberships.status, "active"),
-        sql`${memberships.endDate} >= ${today}`,
-      ),
-    )
-    .orderBy(desc(memberships.endDate))
-    .get();
-}
 
 export const bookingsRouter = router({
   mine: protectedProcedure
@@ -124,14 +107,8 @@ export const bookingsRouter = router({
         });
       }
 
-      const [{ count }] = await ctx.db
-        .select({ count: sql<number>`count(*)` })
-        .from(bookings)
-        .where(
-          and(eq(bookings.classId, cls.id), eq(bookings.status, "booked")),
-        );
-
-      const isFull = Number(count) >= cls.capacity;
+      const count = await countActiveBookings(ctx.db, bookings, cls.id);
+      const isFull = count >= cls.capacity;
 
       const created = await ctx.db
         .insert(bookings)
@@ -148,7 +125,13 @@ export const bookingsRouter = router({
       if (!isFull && !unlimited) {
         await ctx.db
           .update(memberships)
-          .set({ creditsRemaining: membership.creditsRemaining - cls.creditCost })
+          .set({
+            creditsRemaining: adjustIndividualCredits(
+              membership.creditsRemaining,
+              -cls.creditCost,
+              false,
+            ),
+          })
           .where(eq(memberships.id, membership.id));
       }
 
@@ -169,9 +152,7 @@ export const bookingsRouter = router({
         throw new TRPCError({ code: "NOT_FOUND", message: "Booking not found." });
       }
 
-      const isOwner = row.booking.userId === ctx.user.id;
-      const isStaff = ctx.user.role === "admin" || ctx.user.role === "trainer";
-      if (!isOwner && !isStaff) {
+      if (!canManageBooking(ctx.user, row.booking.userId)) {
         throw new TRPCError({
           code: "FORBIDDEN",
           message: "You cannot cancel this booking.",
@@ -204,24 +185,20 @@ export const bookingsRouter = router({
         if (ms && ms.creditsRemaining < UNLIMITED_CREDITS) {
           await ctx.db
             .update(memberships)
-            .set({ creditsRemaining: ms.creditsRemaining + row.booking.creditsUsed })
+            .set({
+              creditsRemaining: adjustIndividualCredits(
+                ms.creditsRemaining,
+                row.booking.creditsUsed,
+                false,
+              ),
+            })
             .where(eq(memberships.id, ms.id));
         }
       }
 
       // Freeing a confirmed spot promotes the member who has waited longest.
       if (row.booking.status === "booked") {
-        const next = await ctx.db
-          .select()
-          .from(bookings)
-          .where(
-            and(
-              eq(bookings.classId, row.cls.id),
-              eq(bookings.status, "waitlisted"),
-            ),
-          )
-          .orderBy(asc(bookings.bookedAt))
-          .get();
+        const next = await findOldestWaitlistedBooking(ctx.db, row.cls.id);
 
         if (next) {
           await ctx.db
@@ -240,9 +217,10 @@ export const bookingsRouter = router({
               await ctx.db
                 .update(memberships)
                 .set({
-                  creditsRemaining: Math.max(
-                    0,
-                    ms.creditsRemaining - row.cls.creditCost,
+                  creditsRemaining: adjustIndividualCredits(
+                    ms.creditsRemaining,
+                    -row.cls.creditCost,
+                    true,
                   ),
                 })
                 .where(eq(memberships.id, ms.id));

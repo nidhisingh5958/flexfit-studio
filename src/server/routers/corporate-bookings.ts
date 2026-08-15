@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import {
   corporateBookings,
   classes,
@@ -10,16 +10,17 @@ import {
   users,
 } from "@/db/schema";
 import { router, protectedProcedure, staffProcedure } from "../trpc";
+import { hoursUntil } from "@/server/domain/shared/time";
+import { canManageBooking } from "@/server/domain/booking/authorization";
+import { adjustCorporatePool } from "@/server/domain/corporate/credit-pool";
+import { countActiveBookings } from "@/server/domain/booking/capacity";
+import { findOldestWaitlistedCorporateBooking } from "@/server/domain/booking/waitlist";
 
 /**
  * Corporate members may cancel free of charge up to this many hours before
  * the class starts. Cancelling later still frees the spot but forfeits the credit.
  */
 export const CORPORATE_FREE_CANCELLATION_HOURS = 24;
-
-function hoursUntil(iso: string, now = new Date()): number {
-  return (new Date(iso).getTime() - now.getTime()) / 36e5;
-}
 
 async function getCompanyForMember(
   db: typeof import("@/db").db,
@@ -128,17 +129,8 @@ export const corporateBookingsRouter = router({
         });
       }
 
-      const [{ count }] = await ctx.db
-        .select({ count: sql<number>`count(*)` })
-        .from(corporateBookings)
-        .where(
-          and(
-            eq(corporateBookings.classId, cls.id),
-            eq(corporateBookings.status, "booked"),
-          ),
-        );
-
-      const isFull = Number(count) >= cls.capacity;
+      const count = await countActiveBookings(ctx.db, corporateBookings, cls.id);
+      const isFull = count >= cls.capacity;
 
       const created = await ctx.db
         .insert(corporateBookings)
@@ -156,7 +148,11 @@ export const corporateBookingsRouter = router({
         await ctx.db
           .update(companies)
           .set({
-            creditPoolBalance: company.creditPoolBalance - cls.creditCost,
+            creditPoolBalance: adjustCorporatePool(
+              company.creditPoolBalance,
+              -cls.creditCost,
+              false,
+            ),
           })
           .where(eq(companies.id, company.id));
       }
@@ -178,9 +174,7 @@ export const corporateBookingsRouter = router({
         throw new TRPCError({ code: "NOT_FOUND", message: "Booking not found." });
       }
 
-      const isOwner = row.booking.userId === ctx.user.id;
-      const isStaff = ctx.user.role === "admin" || ctx.user.role === "trainer";
-      if (!isOwner && !isStaff) {
+      if (!canManageBooking(ctx.user, row.booking.userId)) {
         throw new TRPCError({
           code: "FORBIDDEN",
           message: "You cannot cancel this booking.",
@@ -214,8 +208,11 @@ export const corporateBookingsRouter = router({
           await ctx.db
             .update(companies)
             .set({
-              creditPoolBalance:
-                company.creditPoolBalance + row.booking.creditsUsed,
+              creditPoolBalance: adjustCorporatePool(
+                company.creditPoolBalance,
+                row.booking.creditsUsed,
+                false,
+              ),
             })
             .where(eq(companies.id, company.id));
         }
@@ -223,17 +220,7 @@ export const corporateBookingsRouter = router({
 
       // Freeing a confirmed spot promotes the member who has waited longest.
       if (row.booking.status === "booked") {
-        const next = await ctx.db
-          .select()
-          .from(corporateBookings)
-          .where(
-            and(
-              eq(corporateBookings.classId, row.cls.id),
-              eq(corporateBookings.status, "waitlisted"),
-            ),
-          )
-          .orderBy(asc(corporateBookings.bookedAt))
-          .get();
+        const next = await findOldestWaitlistedCorporateBooking(ctx.db, row.cls.id);
 
         if (next) {
           await ctx.db
@@ -251,9 +238,10 @@ export const corporateBookingsRouter = router({
             await ctx.db
               .update(companies)
               .set({
-                creditPoolBalance: Math.max(
-                  0,
-                  company.creditPoolBalance - row.cls.creditCost,
+                creditPoolBalance: adjustCorporatePool(
+                  company.creditPoolBalance,
+                  -row.cls.creditCost,
+                  true,
                 ),
               })
               .where(eq(companies.id, company.id));
